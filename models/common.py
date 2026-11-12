@@ -37,7 +37,7 @@ if not valid_runs:
     raise FileNotFoundError(
         f"No complete training run found under '{ROOT}'. Expected files: {required_files}"
     )
-RUN = valid_runs[-1]  # use the latest complete run
+RUN = ROOT / "run_20261111_135602_491576" # use the latest complete run
 RES = RUN / "results"; RES.mkdir(exist_ok=True)
 
 with open(RUN / "features.json", "r", encoding="utf-8") as fh:
@@ -47,8 +47,7 @@ norm  = pd.read_csv(RUN / "train_normal.csv")      # healthy rows, train engines
 test  = pd.read_csv(RUN / "test_all.csv")
 train_lab = full[full.split == "train"].reset_index(drop=True)   # labelled train engines
 yte = test["label"].values
-Q_GRID = [(0.90, 0.99), (0.95, 0.99), (0.95, 0.999), (0.99, 0.999)]
-
+Q_GRID = [(0.80, 0.98), (0.80, 0.99), (0.90, 0.99), (0.90, 0.999), (0.95, 0.99), (0.95, 0.999), (0.99, 0.999)]
 def zones(s, t1, t2):
     return np.where(s <= t1, "normal", np.where(s <= t2, "near_anomaly", "anomaly"))
 
@@ -91,7 +90,7 @@ def f_lof(X, k=35):
     m = LocalOutlierFactor(n_neighbors=k, novelty=True).fit(sub(X)); return lambda Z: -m.score_samples(Z)
 def f_autoenc(X, h=(8, 3, 8)):
     S = sub(X, 30000)
-    m = MLPRegressor(hidden_layer_sizes=h, max_iter=60, early_stopping=True, random_state=42).fit(S, S)
+    m = MLPRegressor(hidden_layer_sizes=h, max_iter=200, early_stopping=True, random_state=42).fit(S, S)
     return lambda Z: ((Z - m.predict(Z)) ** 2).sum(1)
 def f_oja(X, k=4, epochs=3, lr=1e-3):     # Hebbian: Sanger's rule
     X = sub(X, 20000); rng = np.random.RandomState(0); W = rng.normal(0, .1, (k, X.shape[1]))
@@ -102,7 +101,7 @@ def f_oja(X, k=4, epochs=3, lr=1e-3):     # Hebbian: Sanger's rule
 
 GRIDS = {
   "Mahalanobis (d=1)": (f_canari, [dict(d=1, reg=1e-6)]),
-  "CANARI":            (f_canari, [dict(d=d, reg=r) for d in (2, 3) for r in (1e-6, 1e-3)]),
+  "CANARI": (f_canari, [dict(d=2, reg=r) for r in (1e-6, 1e-3, 1e-1)]),
   "Isolation Forest":  (f_iforest, [dict(n=200), dict(n=400)]),
   "One-Class SVM":     (f_ocsvm, [dict(nu=0.02), dict(nu=0.05)]),
   "LOF":               (f_lof, [dict(k=20), dict(k=50)]),
@@ -124,3 +123,59 @@ def cv_tune(factory, grid, k=5):      # GroupKFold by engine on TRAIN engines on
         for q, v in res.items():
             if np.mean(v) > best[0]: best = (np.mean(v), params, q)
     return best
+
+# ---------- temporal smoothing (CANARI+Smooth) ----------
+def smooth(s, df, span):
+    """EWMA of score per engine, in cycle order (causal). Returns array in df's row order."""
+    o = np.lexsort((df["cycle"].values, df["unit"].values))
+    t = pd.Series(np.asarray(s)[o]).groupby(df["unit"].values[o]).transform(
+        lambda x: x.ewm(span=span, adjust=False).mean()).values
+    out = np.empty_like(t); out[o] = t; return out
+
+def cv_smooth(params, q, spans=(1, 5, 10, 20), k=5):   # choose span on train engines only
+    res = {s: [] for s in spans}
+    for tr, va in GroupKFold(k).split(train_lab, groups=train_lab["unit"]):
+        T, V = train_lab.iloc[tr], train_lab.iloc[va]; Tn = T[T.label == "normal"]
+        a, b = next(GroupShuffleSplit(1, test_size=0.2, random_state=42).split(Tn, groups=Tn["unit"]))
+        Nf, Nc = Tn.iloc[a], Tn.iloc[b]
+        fn = f_canari(Nf[feats].values, **params)
+        sc, sv = np.log(fn(Nc[feats].values)), np.log(fn(V[feats].values))
+        for s in spans:
+            t1, t2 = np.quantile(smooth(sc, Nc, s), q)
+            res[s].append(f1_score(V.label, zones(smooth(sv, V, s), t1, t2), average="macro"))
+    return max(res, key=lambda s: np.mean(res[s]))
+# ---------- few-label threshold calibration ----------
+def pick_thresholds(score, labels, K=80):
+    """Choose t1, t2 maximising macro-F1 on a small labelled set (fast, count-based)."""
+    qs = np.unique(np.quantile(score, np.linspace(0.30, 0.995, K)))
+    cls = ["normal", "near_anomaly", "anomaly"]
+    idx = np.searchsorted(qs, score, side="left")
+    C = np.array([np.cumsum(np.bincount(idx[labels == c], minlength=len(qs) + 1))[:len(qs)] for c in cls])
+    n = np.array([(labels == c).sum() for c in cls])
+    best = (-1, None, None)
+    for i in range(len(qs) - 1):
+        j = np.arange(i + 1, len(qs))
+        z0 = C[:, i][:, None] * np.ones(len(j))          # zone normal, per class
+        z1 = C[:, j] - C[:, [i]]                         # zone near
+        z2 = n[:, None] - C[:, j]                        # zone anomaly
+        f = 0
+        for k, z in enumerate((z0, z1, z2)):
+            tp, pred = z[k], z.sum(0)
+            f = f + np.where(pred + n[k] > 0, 2 * tp / np.maximum(pred + n[k], 1), 0)
+        f = f / 3; b = f.argmax()
+        if f[b] > best[0]: best = (f[b], qs[i], qs[j[b]])
+    return best[1], best[2]
+
+def few_label_eval(score_tr, score_te, fracs=(0.02, 0.05, 0.10, 0.20), seeds=5):
+    """score_tr: scores on train_lab rows (same order). Returns {frac: mean macroF1 on test}."""
+    units = train_lab["unit"].unique(); out = {}
+    for fr in fracs:
+        vals = []
+        for sd in range(seeds):
+            rng = np.random.RandomState(sd)
+            pick = rng.choice(units, max(3, int(len(units) * fr)), replace=False)
+            m = train_lab["unit"].isin(pick).values
+            t1, t2 = pick_thresholds(score_tr[m], train_lab["label"].values[m])
+            vals.append(f1_score(yte, zones(score_te, t1, t2), average="macro"))
+        out[fr] = (np.mean(vals), np.std(vals))
+    return out
